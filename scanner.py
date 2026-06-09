@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+"""
+Ferrari F12 Canada Scanner
+Scans 20+ Canadian sources for used Ferrari F12 listings, verifies they're live,
+and emails the results.
+"""
+
+import os
+import re
+import json
+import smtplib
+import ssl
+import urllib3
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+
+import requests
+import cloudscraper
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+EMAIL_TO = "jeffrey.dyck@gmail.com"
+EMAIL_FROM = "jeffrey.dyck@gmail.com"
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 465
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+SS_FALSE = {"verify": False}
+
+SESSION = cloudscraper.create_scraper()
+
+
+def fetch_autotrader(url, label):
+    """Fetch F12 listings from AutoTrader.ca or AutoHebdo.net via Next.js data."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+
+        m = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            r.text, re.DOTALL,
+        )
+        if not m:
+            return [], "No __NEXT_DATA__ found"
+
+        data = json.loads(m.group(1))
+        listings = data.get("props", {}).get("pageProps", {}).get("listings", [])
+        results = []
+        for lst in listings:
+            veh = lst.get("vehicle", {})
+            loc = lst.get("location", {})
+            price = lst.get("price", {})
+            seller = lst.get("seller", {})
+            u = lst.get("url", "")
+            if u and not u.startswith("http"):
+                u = f"https://www.autotrader.ca{u}"
+            results.append({
+                "id": lst.get("id", ""),
+                "source": label,
+                "year": veh.get("modelYear", ""),
+                "make": veh.get("make", ""),
+                "model": veh.get("model", ""),
+                "price": price.get("priceFormatted", "N/A"),
+                "mileage": veh.get("mileageInKm", "N/A"),
+                "transmission": veh.get("transmission", ""),
+                "city": loc.get("city", ""),
+                "province": loc.get("provinceCode", ""),
+                "country": loc.get("countryCode", ""),
+                "seller_type": seller.get("type", ""),
+                "url": u,
+            })
+        return results, None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_sr_autogroup(url, label):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+
+        text = r.text
+        text_lower = text.lower()
+
+        # Check for sold indicators
+        if re.search(r'>sold<', text_lower):
+            return [], "Listing sold"
+
+        price_m = re.search(r'\$([\d,]+)', text)
+        year_m = re.search(r'\b(201[3-7])\b', text)
+        km_m = re.search(r'(\d[\d,]*)\s*kms', text, re.I)
+
+        price = f"${price_m.group(1)}" if price_m else "N/A"
+        year = year_m.group(1) if year_m else ""
+        mileage = f"{km_m.group(1)} km" if km_m else ""
+
+        return [{
+            "id": url,
+            "source": label,
+            "year": year,
+            "make": "Ferrari",
+            "model": "F12",
+            "price": price,
+            "mileage": mileage,
+            "city": "Vancouver",
+            "province": "BC",
+            "country": "CA",
+            "seller_type": "Dealer",
+            "url": url,
+        }], None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_toybox(url, label):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+
+        text = r.text
+        text_lower = text.lower()
+        if re.search(r'>sold<', text_lower):
+            return [], "Listing sold"
+
+        price_m = re.search(r'\$([\d,]+)', text)
+        year_m = re.search(r'\b(201[3-7])\b', text)
+        price = f"${price_m.group(1)}" if price_m else "N/A"
+        year = year_m.group(1) if year_m else ""
+
+        return [{
+            "id": url,
+            "source": label,
+            "year": year,
+            "make": "Ferrari",
+            "model": "F12",
+            "price": price,
+            "mileage": "",
+            "city": "Vancouver",
+            "province": "BC",
+            "country": "CA",
+            "seller_type": "Dealer",
+            "url": url,
+        }], None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_luxurypulse(url, label):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text
+        if "no longer available" in text.lower() or "listing has ended" in text.lower():
+            return [], "Listing ended"
+        price_m = re.search(r'\$\s*([0-9,]+)', text)
+        price = f"${price_m.group(1)}" if price_m else "N/A"
+        return [{
+            "id": url,
+            "source": label,
+            "year": "2017",
+            "make": "Ferrari",
+            "model": "F12 TDF",
+            "price": price,
+            "mileage": "600 km",
+            "city": "Montreal",
+            "province": "QC",
+            "country": "CA",
+            "seller_type": "Dealer (Ferrari Quebec)",
+            "url": url,
+        }], None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_drivemotorsports(url, label):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text.lower()
+        if "f12" not in text:
+            return [], "No F12 in inventory"
+        results = []
+        for m in re.finditer(r'F12', r.text):
+            start = max(0, m.start() - 100)
+            end = min(len(r.text), m.end() + 100)
+            ctx = r.text[start:end]
+            price_m = re.search(r'\$\s*([0-9,]+)', ctx)
+            year_m = re.search(r'\b(201[3-7])\b', ctx)
+            if year_m:
+                results.append({
+                    "id": f"dms-{year_m.group(1)}",
+                    "source": label,
+                    "year": year_m.group(1),
+                    "make": "Ferrari",
+                    "model": "F12",
+                    "price": f"${price_m.group(1)}" if price_m else "N/A",
+                    "mileage": "",
+                    "city": "Richmond",
+                    "province": "BC",
+                    "country": "CA",
+                    "seller_type": "Dealer",
+                    "url": url,
+                })
+                break
+        return results, None
+    except Exception as e:
+        return [], str(e)
+
+
+# ---------- NEW SOURCES ----------
+
+def fetch_ferrari_dealer(url, label):
+    """Fetch from official Ferrari dealer (uses ferraridealers.com platform)."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20, **SS_FALSE)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text
+
+        # Check if F12 is mentioned as an actual listing (not just filter options)
+        # These pages show vehicle cards with prices for each car
+        # Search for vehicle listing patterns: nearby year + $price + F12 model name
+        price_near_f12 = False
+        for m in re.finditer(r'F12berlinetta|F12 Berlinetta|F12\b', r.text):
+            start = max(0, m.start() - 200)
+            end = min(len(r.text), m.end() + 200)
+            ctx = r.text[start:end]
+            # Skip image URLs and model filter options
+            if re.search(r'(src=|href=|image|\.jpg|\.png|count["\']?\s*[:=])', ctx, re.I):
+                continue
+            price_m = re.search(r'\$\s*([0-9,]+)', ctx)
+            year_m = re.search(r'\b(201[3-7])\b', ctx)
+            if price_m and year_m:
+                price_near_f12 = True
+                city_prov = {
+                    "Ontario": ("Vaughan", "ON"),
+                    "Vancouver": ("Vancouver", "BC"),
+                    "Alberta": ("Calgary", "AB"),
+                    "Quebec": ("Montreal", "QC"),
+                }
+                city, prov = city_prov.get(label.replace("Ferrari ", ""), ("", ""))
+                return [{
+                    "id": f"ferrari-{label}-{year_m.group(1)}",
+                    "source": f"Ferrari {label}",
+                    "year": year_m.group(1),
+                    "make": "Ferrari",
+                    "model": "F12",
+                    "price": f"${price_m.group(1)}",
+                    "mileage": "",
+                    "city": city,
+                    "province": prov,
+                    "country": "CA",
+                    "seller_type": "Official Ferrari Dealer",
+                    "url": url,
+                }], None
+        if not price_near_f12:
+            return [], "No F12 listing in inventory (filter reference only)"
+        return [], None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_generic_dealer(url, label, city, province, search_term="F12"):
+    """Generic fetcher for dealer inventory pages."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20, **SS_FALSE)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text
+        if search_term.lower() not in text.lower():
+            return [], f"No {search_term} found"
+
+        # Check for actual F12 vehicle listing (not image URLs or hashes)
+        # Look for year + model name near each other with a price
+        for m in re.finditer(r'(?:201[3-7]).{0,100}(?:F12|F12berlinetta)', r.text, re.I):
+            ctx_start = max(0, m.start() - 50)
+            ctx_end = min(len(r.text), m.end() + 50)
+            ctx = r.text[ctx_start:ctx_end]
+            # Skip image URLs
+            if re.search(r'\.(jpg|png|webp|svg|gif)\b', ctx, re.I):
+                continue
+            price_m = re.search(r'\$\s*([0-9,]+)', ctx)
+            year_m = re.search(r'\b(201[3-7])\b', ctx)
+            if year_m:
+                return [{
+                    "id": f"{label.lower().replace(' ','')}-{year_m.group(1)}",
+                    "source": label,
+                    "year": year_m.group(1),
+                    "make": "Ferrari",
+                    "model": "F12",
+                    "price": f"${price_m.group(1)}" if price_m else "N/A",
+                    "mileage": "",
+                    "city": city,
+                    "province": province,
+                    "country": "CA",
+                    "seller_type": "Dealer",
+                    "url": url,
+                }], None
+        return [], "F12 referenced but no active listing detected"
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_kijiji(url, label):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text.lower()
+        # Check for actual listings (not just search page header references)
+        # Look for a year + F12 pattern near each other with a price
+        for m in re.finditer(r'(?:201[3-7]).{0,100}(?:f12|f12berlinetta)', text):
+            ctx = m.group()
+            if re.search(r'\.(jpg|png|webp)', ctx):
+                continue
+            return [{
+                "id": f"kijiji-{len(m.group())}",
+                "source": label,
+                "year": re.search(r'201[3-7]', ctx).group(),
+                "make": "Ferrari",
+                "model": "F12",
+                "price": "N/A",
+                "mileage": "",
+                "city": "",
+                "province": "",
+                "country": "CA",
+                "seller_type": "Private/Dealer",
+                "url": url,
+            }], None
+        return [], "No F12 listings found on Kijiji"
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_cargurus(url, label):
+    try:
+        r = SESSION.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text.lower()
+        if "f12" not in text or "0 results" in text:
+            return [], "No F12 listings on CarGurus.ca"
+        return [], "F12 model referenced but no active listings detected"
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_jamesedition(url, label):
+    try:
+        r = SESSION.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text.lower()
+        if "f12" not in text:
+            return [], "No F12 found"
+        results = []
+        for m in re.finditer(r'\$\s*[\d,]+', r.text):
+            ctx_start = max(0, m.start() - 200)
+            ctx_end = min(len(r.text), m.end() + 200)
+            ctx = r.text[ctx_start:ctx_end].lower()
+            if "f12" in ctx and ("canada" in ctx or "montr" in ctx or "toronto" in ctx or "vancouver" in ctx):
+                year_m = re.search(r'\b(201[3-7])\b', ctx)
+                results.append({
+                    "id": f"jamesedition-{len(results)}",
+                    "source": label,
+                    "year": year_m.group(1) if year_m else "",
+                    "make": "Ferrari",
+                    "model": "F12",
+                    "price": m.group(0),
+                    "mileage": "",
+                    "city": "",
+                    "province": "",
+                    "country": "CA",
+                    "seller_type": "Aggregator",
+                    "url": url,
+                })
+                break
+        return results, None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_pfaff_reserve(url, label):
+    """Fetch from Pfaff Reserve (D2C Media platform - limited data without JS)."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20, verify=False)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text.lower()
+        if "f12" not in text and "f12berlinetta" not in text:
+            if "ferrari" in text:
+                return [], "No F12 referenced in inventory"
+            return [], "No F12 found"
+
+        price_m = re.search(r'\$\s*([\d,]+)', r.text)
+        year_m = re.search(r'\b(201[3-7])\b', r.text)
+
+        if year_m:
+            return [{
+                "id": "pfaff-reserve",
+                "source": label,
+                "year": year_m.group(1),
+                "make": "Ferrari",
+                "model": "F12",
+                "price": f"${price_m.group(1)}" if price_m else "See AutoTrader.ca",
+                "mileage": "",
+                "city": "Vaughan",
+                "province": "ON",
+                "country": "CA",
+                "seller_type": "Dealer",
+                "url": "https://www.autotrader.ca/cars/ferrari/f12/",
+            }], None
+        return [], "F12 page exists but no listing data in HTML (JS-rendered)"
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_marianetti(url, label):
+    """Fetch from Marianetti Motors (Woodbridge ON)."""
+    SOLID_PATTERNS = re.compile(r'\b(?:sold|vehicle\s+sold)\b', re.I)
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20, verify=False)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text
+        if "f12" not in text.lower() and "f12berlinetta" not in text.lower():
+            return [], "No F12 found"
+
+        # Parse embedded vehicleArray JSON (edealer platform)
+        m = re.search(r'vehicleArray\s*=\s*(\{)', text)
+        if not m:
+            return [], "No vehicleArray found in HTML"
+
+        start = m.start(1)
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    raw = text[start:i + 1]
+                    break
+        else:
+            return [], "Could not parse vehicleArray JSON"
+
+        data = json.loads(raw)
+        results = []
+        for vid, v in data.items():
+            if not isinstance(v, dict):
+                continue
+            model = (v.get("model") or "").lower()
+            desc = (v.get("description") or "").lower()
+            year = v.get("year", "")
+            vin = v.get("vin", "")
+
+            if "f12" not in model:
+                continue
+
+            if SOLID_PATTERNS.search(desc):
+                continue
+
+            mileage = v.get("mileage", "")
+            price_raw = v.get("price", 0) or 0
+            price_str = f"${price_raw:,}" if price_raw else "Contact dealer"
+
+            results.append({
+                "id": f"marianetti-{vin or vid}",
+                "source": label,
+                "year": year,
+                "make": "Ferrari",
+                "model": "F12",
+                "price": price_str,
+                "mileage": f"{mileage} km" if mileage else "",
+                "city": "Woodbridge",
+                "province": "ON",
+                "country": "CA",
+                "seller_type": "Dealer",
+                "url": url,
+            })
+
+        if results:
+            return results, None
+        return [], "All F12 listings sold"
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_kar_auto(url, label):
+    """Fetch from KAR Auto Sales (Mississauga ON)."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20, verify=False)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text.lower()
+        if "f12" not in text:
+            return [], "No F12 found"
+        year_m = re.search(r'\b(201[3-7])\b', r.text)
+        if year_m:
+            return [{
+                "id": "kar-auto",
+                "source": label,
+                "year": year_m.group(1),
+                "make": "Ferrari",
+                "model": "F12",
+                "price": "Contact dealer",
+                "mileage": "",
+                "city": "Mississauga",
+                "province": "ON",
+                "country": "CA",
+                "seller_type": "Dealer",
+                "url": url,
+            }], None
+        return [], "F12 referenced but no listing data"
+    except Exception as e:
+        return [], str(e)
+
+
+FORUM_SALE_RE = re.compile(r'\b(?:for\s*sale|fs[\s:]|wts[\s:]|wtt[\s:]|sale\b)', re.I)
+FORUM_CA_RE = re.compile(r'\b(?:canada|ontario|qu[eé]bec|b\.?c\.?|alberta|british\s*columbia|toronto|vancouver|montr[ée]al|calgary|woodbridge|mississauga|vaughan|oakville|markham|richmond|surrey|gta)\b', re.I)
+FORUM_YEAR_RE = re.compile(r'\b(201[3-7])\b')
+
+
+def fetch_ferrarichat(url, label):
+    """Fetch from FerrariChat F12/812 forum for for-sale posts mentioning Canada."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+
+        threads = []
+        for m in re.finditer(
+            r'<a href="threads/([^"]+)"[^>]*class="PreviewTooltip"[^>]*>([^<]+)</a>',
+            r.text,
+        ):
+            slug = m.group(1)
+            title = m.group(2).strip()
+
+            tid_match = re.search(r'\.(\d+)/', slug)
+            tid = tid_match.group(1) if tid_match else ""
+
+            url_full = f"https://www.ferrarichat.com/forum/threads/{slug}"
+
+            title_lower = title.lower()
+
+            # Check if thread mentions F12 (not just 812)
+            has_f12 = 'f12' in title_lower or 'f12berlinetta' in title_lower or 'tdf' in title_lower
+
+            # Check for for-sale indicators
+            is_sale = bool(FORUM_SALE_RE.search(title))
+
+            # Check for Canada mentions
+            is_ca = bool(FORUM_CA_RE.search(title))
+
+            # Check for year
+            year_m = FORUM_YEAR_RE.search(title)
+            year = year_m.group(1) if year_m else ""
+
+            # Priority: for-sale threads get scored higher
+            if has_f12 and (is_sale or is_ca):
+                threads.append({
+                    "id": f"fchat-{tid}",
+                    "source": label,
+                    "year": year,
+                    "make": "Ferrari",
+                    "model": "F12",
+                    "price": "See thread",
+                    "mileage": "",
+                    "city": "",
+                    "province": "",
+                    "country": "",
+                    "seller_type": "Forum",
+                    "url": url_full,
+                    "title": title,
+                    "reason": ("For-sale" if is_sale else "Canada mention"),
+                })
+
+        if not threads:
+            return [], "No relevant F12 for-sale/Canada threads found"
+
+        # Fetch content for the most promising thread
+        for t in threads[:1]:
+            try:
+                tr = requests.get(t["url"], headers=HEADERS, timeout=20)
+                if tr.status_code == 200:
+                    body = tr.text
+                    # Get first post content
+                    pm = re.search(
+                        r'<blockquote[^>]*class="messageText[^>]*>(.*?)</blockquote>',
+                        body, re.DOTALL,
+                    )
+                    if pm:
+                        content = re.sub(r'<[^>]+>', ' ', pm.group(1))
+                        content = re.sub(r'\s+', ' ', content).strip()[:500]
+                        t["content_snippet"] = content
+                    # Also search for Canada/location in the post
+                    if FORUM_CA_RE.search(body):
+                        t["reason"] = "Canada mention"
+            except Exception:
+                pass
+
+        return threads, None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_dupontregistry(url, label):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text.lower()
+        if "f12" not in text:
+            return [], "No F12 on Dupont Registry"
+        # Check for actual Canadian listing
+        for m in re.finditer(r'\$\s*[\d,]+.{0,200}(?:canada|ontario|quebec|bc\b|alberta)', r.text, re.I | re.DOTALL):
+            ctx = m.group().lower()
+            if "f12" in ctx:
+                return [{
+                    "id": f"dupont-canada",
+                    "source": label,
+                    "year": "",
+                    "make": "Ferrari",
+                    "model": "F12",
+                    "price": m.group(0).split("$")[1].split()[0] if "$" in m.group(0) else "N/A",
+                    "mileage": "",
+                    "city": "",
+                    "province": "",
+                    "country": "CA",
+                    "seller_type": "Aggregator",
+                    "url": url,
+                }], None
+        return [], "F12 referenced but no Canadian listing found"
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_classiccom(url, label):
+    try:
+        r = SESSION.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        text = r.text.lower()
+        if "f12" not in text:
+            return [], "No F12 found"
+        results = []
+        for m in re.finditer(r'kelowna|canada\b', text):
+            ctx_start = max(0, m.start() - 500)
+            ctx_end = min(len(r.text), m.end() + 300)
+            ctx = r.text[ctx_start:ctx_end]
+            if "f12" in ctx.lower():
+                price_m = re.search(r'\$\s*[\d,]+', ctx)
+                year_m = re.search(r'\b(201[3-7])\b', ctx)
+                if year_m:
+                    detail_url = url
+                    link_m = re.search(r'href="(/(?:veh|inventory)/[^"]+)"', ctx)
+                    if link_m:
+                        detail_url = f"https://www.classic.com{link_m.group(1)}"
+                    results.append({
+                        "id": f"classic-{len(results)}",
+                        "source": label,
+                        "year": year_m.group(1),
+                        "make": "Ferrari",
+                        "model": "F12",
+                        "price": f"${price_m.group(1)}" if price_m else "N/A",
+                        "mileage": "",
+                        "city": "Kelowna" if "kelowna" in ctx.lower() else "",
+                        "province": "BC",
+                        "country": "CA",
+                        "seller_type": "Aggregator",
+                        "url": detail_url,
+                    })
+                    break
+        return results, None
+    except Exception as e:
+        return [], str(e)
+
+
+SOURCES = [
+    # Original sources
+    ("autotrader", "https://www.autotrader.ca/cars/ferrari/f12", "AutoTrader.ca", fetch_autotrader),
+    ("autohebdo", "https://www.autohebdo.net/cars/ferrari/f12", "AutoHebdo.net", fetch_autotrader),
+    ("sr_auto", "https://www.srautogroup.com/2015-ferrari-f12", "SR Auto Group (Vancouver)", fetch_sr_autogroup),
+    ("toybox", "https://www.toyboxauto.ca/cars/2017-ferrari-f12---70th-anniversary", "Toybox (Vancouver)", fetch_toybox),
+    ("luxurypulse", "https://luxurypulse.com/sales/show/2505-ferrari-f12tdf", "Ferrari Quebec (LuxuryPulse)", fetch_luxurypulse),
+    ("drivemotorsports", "https://www.drivemotorsports.ca/vehicles/ferrari/", "Drive Motor Sports (Richmond BC)", fetch_drivemotorsports),
+
+    # Official Ferrari dealers (same platform by CDK Global)
+    ("ferrari_ontario", "https://ontario.ferraridealers.com/en-US/r/used-ferrari/f", "Ferrari of Ontario", fetch_ferrari_dealer),
+    ("ferrari_vancouver", "https://vancouver.ferraridealers.com/en-US/r/used-ferrari/f", "Ferrari of Vancouver", fetch_ferrari_dealer),
+    ("ferrari_alberta", "https://alberta.ferraridealers.com/en-US/r/used-ferrari/f", "Ferrari of Alberta", fetch_ferrari_dealer),
+    ("ferrari_quebec", "https://quebec.ferraridealers.com/en-US/r/used-ferrari/f", "Ferrari Quebec", fetch_ferrari_dealer),
+
+    # Luxury/exotic dealers
+    ("grandtouring", "https://www.grandtouringautos.com/", "Grand Touring Automobiles", lambda u, l: fetch_generic_dealer(u, l, "Oakville", "ON")),
+    ("sherwood", "https://www.sherwoodmotorcars.com/ferrari-inventory", "Sherwood Motorcars (AB)", lambda u, l: fetch_generic_dealer(u, l, "Sherwood Park", "AB")),
+    ("johnscotti", "https://johnscottiluxuryprestige.com/en/pre-owned", "John Scotti Luxury-Prestige (QC)", lambda u, l: fetch_generic_dealer(u, l, "Montreal", "QC")),
+    ("worldfinecars", "https://www.worldfinecars.ca/", "World Fine Cars (ON)", lambda u, l: fetch_generic_dealer(u, l, "Etobicoke", "ON")),
+    ("weissach", "https://www.weissach.com/vehicles/", "Weissach Performance (BC)", lambda u, l: fetch_generic_dealer(u, l, "Vancouver", "BC")),
+    ("silverarrow", "https://silverarrowcars.com/collections/cars", "Silver Arrow Cars (BC)", lambda u, l: fetch_generic_dealer(u, l, "Victoria", "BC")),
+    ("august", "https://www.augustmotorcars.com/", "August Motorcars (BC)", lambda u, l: fetch_generic_dealer(u, l, "Kelowna", "BC")),
+
+    # Aggregator / marketplace sources
+    ("kijiji", "https://www.kijiji.ca/b-cars/ontario/ferrari-f12/k0c174l9004", "Kijiji Autos", fetch_kijiji),
+    ("cargurus", "https://www.cargurus.ca/Cars/l-Used-Ferrari-F12-Berlinetta-c24242", "CarGurus.ca", fetch_cargurus),
+    ("jamesedition", "https://www.jamesedition.com/cars/ferrari/f12", "JamesEdition", fetch_jamesedition),
+    ("dupont", "https://www.dupontregistry.com/used-ferrari-f12--berlinetta-for-sale", "Dupont Registry", fetch_dupontregistry),
+    ("classiccom", "https://www.classic.com/m/ferrari/f12/", "Classic.com", fetch_classiccom),
+
+    # D2C Media platform (JS-rendered; listing data on AutoTrader.ca)
+    ("pfaff", "https://www.pfaffreserve.com/used/Ferrari-F12berlinetta.html", "Pfaff Reserve (ON)", fetch_pfaff_reserve),
+
+    # Marianetti Motors - D2C Media platform
+    ("marianetti", "https://www.marianettimotors.com/used/Ferrari-F12berlinetta.html", "Marianetti Motors (ON)", fetch_marianetti),
+
+    # KAR Auto Sales - used cars Mississauga
+    ("karauto", "https://www.karautosales.ca/", "KAR Auto Sales (ON)", fetch_kar_auto),
+
+    # FerrariChat F12/812 forum - monitor for-sale / Canada mentions
+    ("ferrarichat", "https://www.ferrarichat.com/forum/forums/f12-812.360/", "FerrariChat F12/812 Forum", fetch_ferrarichat),
+]
+
+# FMP Motorcars: website could not be found.
+
+
+def validate_listing(listing_url):
+    """Verify a listing page is still live and shows the car for sale."""
+    try:
+        r = SESSION.get(listing_url, headers=HEADERS, timeout=15, allow_redirects=True)
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}"
+
+        m = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            r.text, re.DOTALL,
+        )
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                ld = data.get("props", {}).get("pageProps", {}).get("listingDetails", {})
+                if ld:
+                    status = ld.get("status", "")
+                    if status == "Active":
+                        return True, "Active"
+                    elif status in ("Sold", "Inactive", "Deleted"):
+                        return False, f"Status: {status}"
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        text_lower = r.text.lower()
+        dead_phrases = [
+            "no longer available",
+            "this vehicle is no longer for sale",
+            "listing removed",
+            "this listing has ended",
+            "this car has been sold",
+            "listing expired",
+            "either sold, or removed",
+        ]
+        # Check for standalone "sold" badge in HTML (like <span>SOLD</span>)
+        if re.search(r'>sold<', text_lower):
+            return False, "Not available (sold)"
+        for phrase in dead_phrases:
+            if phrase in text_lower:
+                return False, "Not available"
+
+        return True, "Live"
+    except Exception as e:
+        return False, str(e)
+
+
+def build_html_table(listings, source_results):
+    rows = ""
+    for l in listings:
+        badge = (
+            '<span style="color:green;font-weight:bold">LIVE</span>'
+            if l.get("verified")
+            else f'<span style="color:red">DEAD: {l.get("verify_msg", "")}</span>'
+        )
+        rows += f"""<tr>
+            <td>{l['year']}</td>
+            <td>{l['price']}</td>
+            <td>{l['mileage']}</td>
+            <td>{l['city']}, {l['province']}</td>
+            <td>{l['source']}</td>
+            <td>{l['seller_type']}</td>
+            <td><a href="{l['url']}">Link</a></td>
+            <td>{badge}</td>
+        </tr>"""
+
+    src_rows = ""
+    for label, result in source_results:
+        color = "#333"
+        if result.startswith("Error") or result.startswith("Blocked") or "sold" in result.lower():
+            color = "#c0392b"
+        elif "listing" in result.lower():
+            color = "#27ae60"
+        elif result.startswith("No "):
+            color = "#888"
+        src_rows += f"""<tr>
+            <td>{label}</td>
+            <td style="color:{color}">{result}</td>
+        </tr>"""
+
+    return f"""<html>
+<head><style>
+    body {{ font-family: Arial, sans-serif; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+    th {{ background-color: #c0392b; color: white; }}
+    tr:nth-child(even) {{ background-color: #f2f2f2; }}
+    .header {{ color: #c0392b; }}
+    .summary {{ margin: 10px 0; padding: 10px; background: #f9f9f9; }}
+</style></head>
+<body>
+    <h2 class="header">Ferrari F12 Canada Listings</h2>
+    <p>{datetime.now().strftime("%B %d, %Y")}</p>
+    <div class="summary">
+        <strong>{len(listings)}</strong> F12 listing(s) found in Canada
+    </div>
+    <table>
+        <tr>
+            <th>Year</th><th>Price</th><th>Mileage</th><th>Location</th>
+            <th>Source</th><th>Seller</th><th>URL</th><th>Status</th>
+        </tr>
+        {rows}
+    </table>
+    <h3 style="margin-top:24px;color:#c0392b;">Sources Checked ({len(source_results)})</h3>
+    <table>
+        <tr><th>Source</th><th>Result</th></tr>
+        {src_rows}
+    </table>
+    <p style="color: #888; font-size: 12px; margin-top: 20px;">
+        Generated by F12 Scanner | Verified at listing source
+    </p>
+</body></html>"""
+
+
+def get_app_password():
+    """Get Gmail app password from env var, .env file, or registry."""
+    pwd = os.environ.get("GMAIL_APP_PASSWORD")
+    if pwd:
+        return pwd
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("GMAIL_APP_PASSWORD="):
+                    return line.split("=", 1)[1]
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            pwd, _ = winreg.QueryValueEx(key, "GMAIL_APP_PASSWORD")
+            return pwd
+    except Exception:
+        pass
+    return None
+
+
+def send_email(html_body, listings):
+    """Send the email via Gmail SMTP."""
+    app_password = get_app_password()
+    if not app_password:
+        print("ERROR: GMAIL_APP_PASSWORD not found (set in .env file or as env var)")
+        return False
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = (
+        f"F12 Scanner - {len(listings)} F12(s) in Canada "
+        f"({datetime.now().strftime('%b %d')})"
+    )
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg.attach(MIMEText(html_body, "html"))
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+            server.login(EMAIL_FROM, app_password)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        print(f"Email sent to {EMAIL_TO}")
+        return True
+    except Exception as e:
+        print(f"Email failed: {e}")
+        return False
+
+
+def main():
+    all_listings = []
+    seen_ids = set()
+    source_results = []
+
+    print("=" * 60)
+    print(f"F12 Scanner - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("=" * 60)
+
+    print("\n--- Phase 1: Fetching ---")
+    print(f"Scanning {len(SOURCES)} sources...\n")
+
+    for key, url, label, fetcher in SOURCES:
+        lsts, err = fetcher(url, label)
+        if err:
+            print(f"  {label}: {err}")
+            source_results.append((label, err))
+            continue
+        n = len(lsts)
+        print(f"  {label}: {n} listing(s)")
+        source_results.append((label, f"{n} listing(s)" if n else "No listings found"))
+        for nl in lsts:
+            dedup = nl.get("id") or nl.get("url", "")
+            if dedup in seen_ids:
+                continue
+            seen_ids.add(dedup)
+            prov = nl.get("province", "")
+            ctry = nl.get("country", "")
+            ca_provs = ("ON", "QC", "BC", "AB", "MB", "SK", "NS", "NB", "NL", "PE", "YT", "NT", "NU")
+            if ctry == "CA" or prov in ca_provs or not prov:
+                all_listings.append(nl)
+                print(f"    + {nl['year']} {nl['model']} - {nl['price']} - {nl.get('city','')}")
+
+    print(f"\n  Total unique Canadian listings: {len(all_listings)}")
+
+    print("\n--- Phase 2: Verification ---")
+    for lst in all_listings:
+        if lst.get("url"):
+            live, msg = validate_listing(lst["url"])
+            lst["verified"] = live
+            lst["verify_msg"] = msg
+            print(f"  {lst['year']} {lst['model']} - {'LIVE' if live else f'DEAD ({msg})'}")
+        else:
+            lst["verified"] = False
+
+    live = [l for l in all_listings if l.get("verified")]
+
+    print("\n--- Phase 3: Email ---")
+    if live:
+        html = build_html_table(live, source_results)
+        sent = send_email(html, live)
+    else:
+        print("  No live listings to email")
+        sent = False
+
+    print(f"\nSUMMARY: {len(live)} live F12(s)")
+    print(f"Email: {'Yes' if sent else 'No'}")
+
+
+if __name__ == "__main__":
+    main()
