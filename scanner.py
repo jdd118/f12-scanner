@@ -751,6 +751,163 @@ def fetch_porsche_gt3_autohebdo(url, label):
     return filtered, None
 
 
+# ---------- PORSCHE FINDER (finder.porsche.com) ----------
+
+_POSTAL_PROVINCE = {
+    "A": "NL", "B": "NS", "C": "PE", "E": "NB",
+    "G": "QC", "H": "QC", "J": "QC",
+    "K": "ON", "L": "ON", "M": "ON", "N": "ON", "P": "ON",
+    "R": "MB", "S": "SK", "T": "AB", "V": "BC",
+    "X": "NT", "Y": "YT",
+}
+
+
+def _extract_rsc_items(text):
+    """Extract the items array from a Porsche Finder RSC page response."""
+    import re, json
+    rsc_parts = re.findall(
+        r'self\.__next_f\.push\(\[(\d+),"((?:[^"\\]|\\.)*)"\]\)',
+        text, re.DOTALL,
+    )
+    if not rsc_parts:
+        return [], 0, 0
+    all_raw = "".join(chunk for _, chunk in rsc_parts)
+    all_data = all_raw.encode().decode("unicode_escape")
+
+    tp = re.search(r'"totalPages":(\d+)', all_data)
+    ap = re.search(r'"activePage":(\d+)', all_data)
+    total_pages = int(tp.group(1)) if tp else 1
+    active_page = int(ap.group(1)) if ap else 1
+
+    idx = all_data.find('"items":[')
+    if idx < 0:
+        return [], active_page, total_pages
+
+    start = idx + len('"items":[')
+    depth = 1
+    i = start
+    while i < len(all_data) and depth > 0:
+        if all_data[i] == "[":
+            depth += 1
+        elif all_data[i] == "]":
+            depth -= 1
+        if depth == 0:
+            end = i
+            break
+        i += 1
+
+    items_str = all_data[start:end]
+    items = []
+    pos = 0
+    while pos < len(items_str):
+        while pos < len(items_str) and items_str[pos] in " ,\n\r\t":
+            pos += 1
+        if pos >= len(items_str) or items_str[pos] != "{":
+            break
+        depth = 0
+        j = pos
+        while j < len(items_str) and (depth > 0 or j == pos):
+            if items_str[j] == "{":
+                depth += 1
+            elif items_str[j] == "}":
+                depth -= 1
+            j += 1
+        try:
+            items.append(json.loads(items_str[pos:j]))
+        except json.JSONDecodeError:
+            break
+        pos = j
+    return items, active_page, total_pages
+
+
+def fetch_porsche_finder(url, label):
+    """Fetch 911 GT3 Touring Manual listings from finder.porsche.com."""
+    results = []
+    seen_ids = set()
+    page = 1
+    total_pages = 1
+
+    while page <= total_pages:
+        page_url = f"{url}&page={page}"
+        try:
+            r = http_get(page_url, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                break
+        except Exception:
+            break
+
+        items, active_page, total_pages = _extract_rsc_items(r.text)
+        if not items or active_page != page:
+            break
+
+        for item in items:
+            meta = item.get("meta", {}) or {}
+            dlm = item.get("dataLayerListingMeta", {}) or {}
+            car = dlm.get("car", {}) or {}
+            seller = meta.get("seller", {}) or {}
+            addr = seller.get("addressComponents", {}) or {}
+
+            model_name = (
+                car.get("modelName") or meta.get("title") or ""
+            )
+            trans = meta.get("transmission", "")
+            model_str = str(model_name)
+
+            if "GT3" not in model_str or "Touring" not in model_str:
+                continue
+            if str(trans).lower() != "manual":
+                continue
+
+            lid = item.get("id", "")
+            if lid in seen_ids:
+                continue
+            seen_ids.add(lid)
+
+            price = car.get("priceTotalTotal")
+            mileage_val = car.get("mileageValue")
+            mileage_unit = car.get("mileageUnit", "KM")
+            mileage = f"{mileage_val} {mileage_unit}" if mileage_val else ""
+
+            city = addr.get("city", "")
+            postal = addr.get("postalCode", "") or seller.get("formattedCity", "")
+            province = _POSTAL_PROVINCE.get((postal or "")[:1].upper(), "")
+
+            details_url = meta.get("detailsUrl", "")
+            if not details_url:
+                slug = item.get("listingUrlSlug", "")
+                details_url = (
+                    f"https://finder.porsche.com/ca/en-CA/details/{slug}"
+                    if slug else ""
+                )
+
+            color = meta.get("exteriorColor") or meta.get("color") or ""
+            year = meta.get("modelYear", "")
+            dealer_name = seller.get("name", "")
+
+            results.append({
+                "id": lid,
+                "source": label,
+                "year": str(year),
+                "make": "Porsche",
+                "model": "911 GT3 Touring",
+                "price": f"${price:,}" if isinstance(price, int) else "N/A",
+                "mileage": mileage or "N/A",
+                "transmission": trans,
+                "city": city,
+                "province": province,
+                "country": "CA",
+                "seller_type": f"Dealer ({dealer_name})",
+                "url": details_url,
+                "description": f"{model_str} - {color}",
+            })
+
+        page += 1
+        if page > total_pages:
+            break
+
+    return results, None
+
+
 SOURCES = [
     # Original sources
     ("autotrader", "https://www.autotrader.ca/cars/ferrari/f12", "AutoTrader.ca", fetch_autotrader),
@@ -797,6 +954,9 @@ SOURCES = [
     # ---------- Porsche 911 GT3 Touring Manual ----------
     ("porsche_autotrader", "https://www.autotrader.ca/cars/porsche/911/?trim=GT3", "AutoTrader.ca (911 GT3)", fetch_porsche_gt3_autotrader),
     ("porsche_autohebdo", "https://www.autohebdo.net/cars/porsche/911/?trim=GT3", "AutoHebdo.net (911 GT3)", fetch_porsche_gt3_autohebdo),
+
+    # finder.porsche.com - official Porsche dealer inventory
+    ("porsche_finder", "https://finder.porsche.com/ca/en_CA/search/911?condition=used", "Porsche Finder CA", fetch_porsche_finder),
 ]
 
 # FMP Motorcars: website could not be found.
@@ -825,6 +985,23 @@ def validate_listing(listing_url):
                         return False, f"Status: {status}"
             except (json.JSONDecodeError, KeyError):
                 pass
+
+        # Porsche Finder validation: check for priceValue in RSC data
+        if "finder.porsche.com" in listing_url:
+            rsc_parts = re.findall(
+                r'self\.__next_f\.push\(\[(\d+),"((?:[^"\\]|\\.)*)"\]\)',
+                r.text, re.DOTALL,
+            )
+            if rsc_parts:
+                all_raw = "".join(chunk for _, chunk in rsc_parts)
+                all_data = all_raw.encode().decode("unicode_escape")
+                # If priceValue exists, the listing is active
+                if '"priceValue":' in all_data:
+                    return True, "Active"
+                # If listingDeleted or listingPaused title is shown, it's dead
+                if '"listingDeleted"' in all_data or '"listingPaused"' in all_data:
+                    return False, "Not available"
+                return False, "No price data"
 
         text_lower = r.text.lower()
         dead_phrases = [
