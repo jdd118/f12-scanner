@@ -29,19 +29,39 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8",
 }
 
-SS_FALSE = {"verify": False}
-
 SESSION = cloudscraper.create_scraper()
+
+# Plain requests session (used as fallback for SSL cert issues)
+RAW_SESSION = requests.Session()
+RAW_SESSION.verify = False
+RAW_SESSION.headers.update(HEADERS)
+
+
+def http_get(url, **kwargs):
+    """Fetch a URL — try cloudscraper first, fallback to verify=False on SSL errors,
+    and retry with requests on 403/406 status codes."""
+    kwargs.setdefault("headers", HEADERS)
+    kwargs.setdefault("timeout", 20)
+    try:
+        r = SESSION.get(url, **kwargs)
+        if r.status_code in (403, 406):
+            kwargs.pop("headers", None)
+            return RAW_SESSION.get(url, **kwargs)
+        return r
+    except Exception:
+        kwargs.pop("headers", None)
+        return RAW_SESSION.get(url, **kwargs)
 
 
 def fetch_autotrader(url, label):
     """Fetch F12 listings from AutoTrader.ca or AutoHebdo.net via Next.js data."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
 
@@ -85,7 +105,7 @@ def fetch_autotrader(url, label):
 
 def fetch_sr_autogroup(url, label):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
 
@@ -124,7 +144,7 @@ def fetch_sr_autogroup(url, label):
 
 def fetch_toybox(url, label):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
 
@@ -158,7 +178,7 @@ def fetch_toybox(url, label):
 
 def fetch_luxurypulse(url, label):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text
@@ -186,7 +206,7 @@ def fetch_luxurypulse(url, label):
 
 def fetch_drivemotorsports(url, label):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text.lower()
@@ -225,7 +245,7 @@ def fetch_drivemotorsports(url, label):
 def fetch_ferrari_dealer(url, label):
     """Fetch from official Ferrari dealer (uses ferraridealers.com platform)."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20, **SS_FALSE)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text
@@ -276,7 +296,7 @@ def fetch_ferrari_dealer(url, label):
 def fetch_generic_dealer(url, label, city, province, search_term="F12"):
     """Generic fetcher for dealer inventory pages."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20, **SS_FALSE)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text
@@ -316,7 +336,7 @@ def fetch_generic_dealer(url, label, city, province, search_term="F12"):
 
 def fetch_kijiji(url, label):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text.lower()
@@ -347,7 +367,7 @@ def fetch_kijiji(url, label):
 
 def fetch_cargurus(url, label):
     try:
-        r = SESSION.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text.lower()
@@ -360,7 +380,7 @@ def fetch_cargurus(url, label):
 
 def fetch_jamesedition(url, label):
     try:
-        r = SESSION.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text.lower()
@@ -396,7 +416,7 @@ def fetch_jamesedition(url, label):
 def fetch_pfaff_reserve(url, label):
     """Fetch from Pfaff Reserve (D2C Media platform - limited data without JS)."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20, verify=False)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text.lower()
@@ -432,7 +452,7 @@ def fetch_marianetti(url, label):
     """Fetch from Marianetti Motors (Woodbridge ON)."""
     SOLID_PATTERNS = re.compile(r'\b(?:sold|vehicle\s+sold)\b', re.I)
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20, verify=False)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text
@@ -502,7 +522,7 @@ def fetch_marianetti(url, label):
 def fetch_kar_auto(url, label):
     """Fetch from KAR Auto Sales (Mississauga ON)."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20, verify=False)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text.lower()
@@ -537,7 +557,7 @@ FORUM_YEAR_RE = re.compile(r'\b(201[3-7])\b')
 def fetch_ferrarichat(url, label):
     """Fetch from FerrariChat F12/812 forum for for-sale posts mentioning Canada."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
+        r = http_get(url, headers=HEADERS, timeout=30)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
 
@@ -594,7 +614,7 @@ def fetch_ferrarichat(url, label):
         # Fetch content for the most promising thread
         for t in threads[:1]:
             try:
-                tr = requests.get(t["url"], headers=HEADERS, timeout=20)
+                tr = http_get(t["url"], headers=HEADERS, timeout=20)
                 if tr.status_code == 200:
                     body = tr.text
                     # Get first post content
@@ -619,7 +639,7 @@ def fetch_ferrarichat(url, label):
 
 def fetch_dupontregistry(url, label):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text.lower()
@@ -650,7 +670,7 @@ def fetch_dupontregistry(url, label):
 
 def fetch_classiccom(url, label):
     try:
-        r = SESSION.get(url, headers=HEADERS, timeout=20)
+        r = http_get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
         text = r.text.lower()
@@ -739,7 +759,7 @@ SOURCES = [
 def validate_listing(listing_url):
     """Verify a listing page is still live and shows the car for sale."""
     try:
-        r = SESSION.get(listing_url, headers=HEADERS, timeout=15, allow_redirects=True)
+        r = http_get(listing_url, headers=HEADERS, timeout=15, allow_redirects=True)
         if r.status_code != 200:
             return False, f"HTTP {r.status_code}"
 
