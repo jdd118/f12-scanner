@@ -908,6 +908,201 @@ def fetch_porsche_finder(url, label):
     return results, None
 
 
+def fetch_winding_road(url, label):
+    """Fetch GT3 listings from Winding Road Motorcars (Langley, BC)."""
+    try:
+        r = http_get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+
+        # Split page by car card wrappers to isolate individual listings
+        parts = re.split(r'<div[^>]*class="[^"]*Car_car__[^"]*"[^>]*>', r.text)
+        if len(parts) < 2:
+            return [], "No car cards found"
+
+        results = []
+        seen = set()
+        # Skip first part (before first car card)
+        for part in parts[1:]:
+            # Close the div at the end of this card (find the matching close)
+            depth = 0
+            close_idx = -1
+            for i, ch in enumerate(part):
+                if ch == "<":
+                    next_ch = part[i:i+2] if i+1 < len(part) else ""
+                    if next_ch == "</":
+                        depth -= 1
+                    elif next_ch == "<!":
+                        continue  # comment
+                    else:
+                        depth += 1
+                if depth < 0:
+                    close_idx = i + len("</div>")
+                    break
+            card_html = part[:close_idx] if close_idx > 0 else part
+
+            slug_m = re.search(r'href="(/inventory/[^"]+)"', card_html)
+            if not slug_m:
+                continue
+            lid = slug_m.group(1)
+            if lid in seen:
+                continue
+            seen.add(lid)
+
+            card_lower = card_html.lower()
+            if "porsche" not in card_lower or "911" not in card_lower or "gt3" not in card_lower:
+                continue
+            if "touring" not in card_lower:
+                continue
+            if "manual" not in card_lower and "6-speed" not in card_lower:
+                continue
+
+            title_m = re.search(r'<p[^>]*class="[^"]*Car_title__[^"]*"[^>]*>(.*?)</p>', card_html)
+            title = title_m.group(1).strip() if title_m else ""
+
+            price_m = re.search(r'<p>\$\s*([\d\s]+)</p>', card_html)
+            price_raw = price_m.group(1).strip() if price_m else ""
+            price = f"${price_raw}" if price_raw else "N/A"
+
+            year_m = re.search(r'<p[^>]*class="[^"]*Car_year__[^"]*"[^>]*>\s*(\d{4})\s*</p>', card_html)
+            year = year_m.group(1) if year_m else ""
+
+            mileage_m = re.search(r'<p[^>]*class="[^"]*Car_miles__[^"]*"[^>]*>\s*([\d,]+)\s*</p>', card_html)
+            mileage = mileage_m.group(1) if mileage_m else ""
+
+            detail_url = f"https://www.windingroad.ca{slug_m.group(1)}"
+
+            results.append({
+                "id": f"windingroad-{lid}",
+                "source": label,
+                "year": year,
+                "make": "Porsche",
+                "model": "911 GT3 Touring",
+                "price": price,
+                "mileage": mileage or "N/A",
+                "transmission": "Manual",
+                "city": "Langley",
+                "province": "BC",
+                "country": "CA",
+                "seller_type": "Dealer (Winding Road Motorcars)",
+                "url": detail_url,
+                "description": title,
+            })
+
+        return results, None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_kijiji_gt3(url, label):
+    """Fetch GT3 listings from Kijiji using embedded JSON-LD structured data."""
+    try:
+        r = http_get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+
+        # Kijiji embeds listing data in JSON-LD script tags
+        jsonld_matches = re.finditer(
+            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+            r.text, re.DOTALL,
+        )
+        items = []
+        for m in jsonld_matches:
+            try:
+                data = json.loads(m.group(1))
+                if data.get("@type") == "ItemList":
+                    elements = data.get("itemListElement", [])
+                    for elem in elements:
+                        item = elem.get("item", {})
+                        if item.get("@type") != "Car":
+                            continue
+                        items.append(item)
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        if not items:
+            return [], "No structured data found on Kijiji"
+
+        results = []
+        seen = set()
+        for item in items:
+            name = item.get("name", "")
+            model_cfg = item.get("vehicleConfiguration", "") or ""
+            model = item.get("model", "")
+            year = str(item.get("vehicleModelDate", ""))
+            offers = item.get("offers", {})
+            price_raw = offers.get("price", "")
+            try:
+                price_int = int(float(price_raw))
+                price_str = f"${price_int:,}"
+            except (ValueError, TypeError):
+                price_str = f"${price_raw}" if price_raw else "N/A"
+            mileage_obj = item.get("mileageFromOdometer", {})
+            mileage_val = mileage_obj.get("value", "") if mileage_obj else ""
+            mileage = f"{mileage_val} km" if mileage_val else ""
+            trans = item.get("vehicleTransmission", "") or ""
+            url_val = item.get("url", "")
+            vin = item.get("vehicleIdentificationNumber", "")
+            color = item.get("color", "")
+            drive = item.get("driveWheelConfiguration", "")
+
+            # Check if it's a GT3 Touring Manual
+            name_lower = name.lower()
+            cfg_lower = model_cfg.lower()
+            trans_lower = str(trans).lower()
+
+            if "gt3" not in name_lower and "gt3" not in cfg_lower:
+                continue
+            is_touring = "touring" in name_lower or "touring" in cfg_lower
+            is_manual = trans_lower == "manual"
+
+            if not (is_touring and is_manual):
+                continue
+
+            if vin in seen:
+                continue
+            seen.add(vin or url_val)
+
+            # Extract city from Kijiji URL path: /v-cars-trucks/<city>/...
+            city = ""
+            province = ""
+            if url_val:
+                city_m = re.search(r'/v-cars-trucks/([^/]+)/', url_val)
+                if city_m:
+                    city = city_m.group(1).replace("-", " ").title().strip()
+                    # Map known Kijiji city slugs to city/province
+                    city_map = {
+                        "Mississauga Peel Region": ("Mississauga", "ON"),
+                        "City Of Toronto": ("Toronto", "ON"),
+                        "Ottawa": ("Ottawa", "ON"),
+                        "London": ("London", "ON"),
+                        "Barrie": ("Barrie", "ON"),
+                    }
+                    if city in city_map:
+                        city, province = city_map[city]
+
+            results.append({
+                "id": f"kijiji-gt3-{vin or len(results)}",
+                "source": label,
+                "year": year,
+                "make": "Porsche",
+                "model": "911 GT3 Touring",
+                "price": price_str,
+                "mileage": mileage or "N/A",
+                "transmission": trans,
+                "city": city,
+                "province": province,
+                "country": "CA",
+                "seller_type": "Private/Dealer",
+                "url": url_val,
+                "description": name,
+            })
+
+        return results, None
+    except Exception as e:
+        return [], str(e)
+
+
 SOURCES = [
     # Original sources
     ("autotrader", "https://www.autotrader.ca/cars/ferrari/f12", "AutoTrader.ca", fetch_autotrader),
@@ -957,6 +1152,12 @@ SOURCES = [
 
     # finder.porsche.com - official Porsche dealer inventory
     ("porsche_finder", "https://finder.porsche.com/ca/en_CA/search/911?condition=used", "Porsche Finder CA", fetch_porsche_finder),
+
+    # Winding Road Motorcars - independent exotic dealer (Langley, BC)
+    ("winding_road", "https://www.windingroad.ca/inventory/", "Winding Road Motorcars (BC)", fetch_winding_road),
+
+    # Kijiji Autos - GT3 search (includes private party + dealer listings)
+    ("kijiji_gt3", "https://www.kijiji.ca/b-cars/ontario/porsche-911-gt3/k0c174l9004", "Kijiji Autos (911 GT3)", fetch_kijiji_gt3),
 ]
 
 # FMP Motorcars: website could not be found.
